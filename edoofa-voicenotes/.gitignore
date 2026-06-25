@@ -1,0 +1,6 @@
+node_modules/
+.env
+service-account.json
+auth_session/
+audio_store/
+*.log
