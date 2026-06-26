@@ -1,16 +1,34 @@
 /**
  * summarize.js
- * Uses Claude to turn a raw transcript into a structured summary +
- * action items. Also used as a FALLBACK for sender-role classification
- * when WhatsApp metadata alone is ambiguous (see roleClassifier.js for
- * the primary, metadata-based approach).
+ * Uses Groq (free tier) to turn a raw transcript into a structured
+ * summary + action items. Sender-role classification is handled
+ * entirely by roleClassifier.js using deterministic WhatsApp metadata
+ * (JID / fromMe) - this module is not involved in that decision and
+ * does not see or infer sender role from transcript content.
+ *
+ * DESIGN DECISION (cost trade-off, stated explicitly for the live
+ * walkthrough): Groq's API is OpenAI-compatible, so we reuse the
+ * `openai` SDK already in package.json (used by transcribe.js for
+ * Whisper) and just point it at Groq's base URL instead of adding a
+ * new dependency. Groq is used here over Claude/GPT-4 purely because
+ * it has a usable free tier for a prototype - production should swap
+ * back to a stronger paid model (Claude Sonnet or GPT-4-class) for
+ * better summarization quality at scale. The swap is a one-line model
+ * name + base URL change, not a rewrite, because both speak the same
+ * Chat Completions-style API shape.
  */
 
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
+
+const GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 class Summarizer {
   constructor(apiKey) {
-    this.client = new Anthropic({ apiKey });
+    this.client = new OpenAI({
+      apiKey,
+      baseURL: GROQ_BASE_URL,
+    });
   }
 
   /**
@@ -39,16 +57,13 @@ ${transcript}
 Respond ONLY in this exact JSON format, no preamble, no markdown fences:
 {"summary": "...", "action_items": "- item one\\n- item two"}`;
 
-    const response = await this.client.messages.create({
-      model: 'claude-sonnet-4-6',
+    const response = await this.client.chat.completions.create({
+      model: GROQ_MODEL,
       max_tokens: 500,
       messages: [{ role: 'user', content: prompt }],
     });
 
-    const text = response.content
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('');
+    const text = response.choices?.[0]?.message?.content || '';
 
     try {
       const cleaned = text.replace(/```json|```/g, '').trim();

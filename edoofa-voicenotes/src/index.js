@@ -50,11 +50,16 @@ const EDOOFA_TEAM_NUMBERS = (process.env.EDOOFA_TEAM_NUMBERS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Reconnect backoff/cap state - see connection.update handler below.
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 8;
+
 async function main() {
   console.log('--- Edoofa Voice Note Pipeline starting ---');
 
-  const transcriber = new Transcriber(process.env.OPENAI_API_KEY);
-  const summarizer = new Summarizer(process.env.ANTHROPIC_API_KEY);
+  // FIX: both Transcriber and Summarizer now use GROQ_API_KEY
+  const transcriber = new Transcriber(process.env.GROQ_API_KEY);
+  const summarizer = new Summarizer(process.env.GROQ_API_KEY);
   const roleClassifier = new RoleClassifier(EDOOFA_TEAM_NUMBERS);
   const sheetLogger = new SheetLogger({
     jsonKeyPath: process.env.GOOGLE_SERVICE_ACCOUNT_JSON_PATH,
@@ -87,12 +92,30 @@ async function main() {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log(`[connection] closed. statusCode=${statusCode}. Reconnecting: ${shouldReconnect}`);
+
       if (shouldReconnect) {
-        main().catch((e) => console.error('[fatal] reconnect failed:', e));
+        reconnectAttempts += 1;
+        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+          console.error(
+            `[fatal] Gave up after ${MAX_RECONNECT_ATTEMPTS} reconnect attempts (last statusCode=${statusCode}).\n` +
+            `This usually means the Baileys library version is out of sync with WhatsApp's\n` +
+            `current protocol. Run: npm install @whiskeysockets/baileys@latest, then restart.`
+          );
+          process.exit(1);
+        }
+        // Exponential-ish backoff (2s, 4s, 6s...) instead of an instant
+        // tight loop - avoids hammering WhatsApp's servers if something
+        // is persistently wrong (which can itself trigger rate limiting).
+        const delayMs = Math.min(reconnectAttempts * 2000, 15000);
+        console.log(`[connection] Retrying in ${delayMs / 1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+        setTimeout(() => {
+          main().catch((e) => console.error('[fatal] reconnect failed:', e));
+        }, delayMs);
       } else {
         console.log('[connection] Logged out. Delete ./auth_session and re-scan QR to relink.');
       }
     } else if (connection === 'open') {
+      reconnectAttempts = 0; // reset on a successful connection
       console.log('[connection] WhatsApp connected successfully. Listening for voice notes...');
     }
   });
@@ -197,14 +220,18 @@ async function handleIncomingMessage(msg, sock, deps) {
 
   try {
     // 5. Transcribe.
+    console.log('[pipeline] Starting transcription...');
     transcript = await transcriber.transcribe(audioFilePath);
+    console.log('[pipeline] Transcription complete.');
 
     // 6. Summarize + extract action items.
+    console.log('[pipeline] Starting summarization...');
     const result = await summarizer.summarize(transcript, {
       studentName,
       senderRole,
       senderName,
     });
+    console.log('[pipeline] Summarization complete.');
     summary = result.summary;
     actionItems = result.actionItems;
   } catch (err) {
